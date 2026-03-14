@@ -1,0 +1,6 @@
+python-telegram-bot==21.5
+yt-dlp>=2024.1.1
+spotipy>=2.23.0
+apscheduler>=3.10.4
+mutagen>=1.47.0
+requests>=2.31.0
