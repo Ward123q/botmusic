@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Music Channel Auto-Post Bot
+Telegram Music Channel Auto-Post Bot with proxy rotation
 """
 
 import os
@@ -37,6 +37,15 @@ COOKIES_FILE = "cookies.txt"
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Список прокси — бот перебирает их по очереди
+PROXIES = [
+    "http://51.79.135.131:8080",
+    "http://64.188.90.36:1080",
+    "http://147.75.34.105:443",
+    "http://91.107.148.58:53967",
+    "http://195.231.69.203:80",
+]
 
 # ─── Логирование ──────────────────────────────────────────────────────────────
 
@@ -89,20 +98,92 @@ def save_posted(posted: list):
         json.dump(posted, f, ensure_ascii=False, indent=2)
 
 
-# ─── YDL опции с куками ───────────────────────────────────────────────────────
+# ─── YDL опции ────────────────────────────────────────────────────────────────
 
-def get_ydl_opts(extra: dict = {}) -> dict:
+def get_ydl_opts(extra: dict = {}, proxy: str = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
     }
     if Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
-        log.info("Используем cookies.txt")
-    else:
-        log.warning("cookies.txt не найден!")
+    if proxy:
+        opts["proxy"] = proxy
+        log.info("Используем прокси: %s", proxy)
     opts.update(extra)
     return opts
+
+
+# ─── Скачивание с перебором прокси ───────────────────────────────────────────
+
+def download_track(url: str) -> dict | None:
+    # Сначала пробуем без прокси
+    proxies_to_try = [None] + PROXIES
+
+    for proxy in proxies_to_try:
+        ydl_opts = get_ydl_opts({
+            "format": "bestaudio/best",
+            "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                },
+                {"key": "FFmpegMetadata"},
+                {"key": "EmbedThumbnail"},
+            ],
+            "writethumbnail": True,
+        }, proxy=proxy)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get("title", "Unknown Title")
+                uploader = info.get("uploader", "Unknown Artist")
+                duration = info.get("duration", 0)
+                thumbnail_url = info.get("thumbnail", "")
+
+                base = Path(ydl.prepare_filename(info)).stem
+                mp3_path = DOWNLOAD_DIR / f"{base}.mp3"
+                if not mp3_path.exists():
+                    candidates = list(DOWNLOAD_DIR.glob("*.mp3"))
+                    mp3_path = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+
+                if not mp3_path or not mp3_path.exists():
+                    log.error("MP3 не найден: %s", url)
+                    continue
+
+                cover_path = None
+                if thumbnail_url:
+                    cover_path = DOWNLOAD_DIR / f"{base}_cover.jpg"
+                    try:
+                        r = requests.get(thumbnail_url, timeout=10)
+                        if r.status_code == 200:
+                            cover_path.write_bytes(r.content)
+                    except Exception:
+                        cover_path = None
+
+                mins = duration // 60
+                secs = duration % 60
+                duration_str = f"{mins}:{secs:02d}" if duration else "0:00"
+
+                log.info("✅ Скачал через прокси: %s", proxy or "без прокси")
+                return {
+                    "file": str(mp3_path),
+                    "cover": str(cover_path) if cover_path and cover_path.exists() else None,
+                    "title": title,
+                    "artist": uploader,
+                    "duration": duration_str,
+                    "source_url": url,
+                }
+
+        except Exception as e:
+            log.warning("Прокси %s не сработал: %s", proxy or "без прокси", str(e)[:100])
+            continue
+
+    log.error("Все прокси не сработали для: %s", url)
+    return None
 
 
 # ─── Разворачивание плейлиста ─────────────────────────────────────────────────
@@ -135,7 +216,6 @@ def expand_queue() -> list:
             expanded = expand_playlist(url)
             new_queue.extend(expanded)
             changed = True
-            log.info("Плейлист → %d треков", len(expanded))
         else:
             new_queue.append(url)
 
@@ -147,77 +227,16 @@ def expand_queue() -> list:
     return queue
 
 
-# ─── Скачивание ───────────────────────────────────────────────────────────────
-
-def download_track(url: str) -> dict | None:
-    ydl_opts = get_ydl_opts({
-        "format": "bestaudio/best",
-        "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            },
-            {"key": "FFmpegMetadata"},
-            {"key": "EmbedThumbnail"},
-        ],
-        "writethumbnail": True,
-    })
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Unknown Title")
-            uploader = info.get("uploader", "Unknown Artist")
-            duration = info.get("duration", 0)
-            thumbnail_url = info.get("thumbnail", "")
-
-            base = Path(ydl.prepare_filename(info)).stem
-            mp3_path = DOWNLOAD_DIR / f"{base}.mp3"
-            if not mp3_path.exists():
-                candidates = list(DOWNLOAD_DIR.glob("*.mp3"))
-                mp3_path = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
-
-            if not mp3_path or not mp3_path.exists():
-                log.error("MP3 не найден: %s", url)
-                return None
-
-            cover_path = None
-            if thumbnail_url:
-                cover_path = DOWNLOAD_DIR / f"{base}_cover.jpg"
-                r = requests.get(thumbnail_url, timeout=10)
-                if r.status_code == 200:
-                    cover_path.write_bytes(r.content)
-
-            mins = duration // 60
-            secs = duration % 60
-            duration_str = f"{mins}:{secs:02d}" if duration else "0:00"
-
-            return {
-                "file": str(mp3_path),
-                "cover": str(cover_path) if cover_path and cover_path.exists() else None,
-                "title": title,
-                "artist": uploader,
-                "duration": duration_str,
-                "source_url": url,
-            }
-    except Exception as e:
-        log.error("Ошибка скачивания: %s — %s", url, e)
-        return None
-
-
 # ─── Подпись ──────────────────────────────────────────────────────────────────
 
 def format_caption(track: dict, number: int) -> str:
     duration = track.get("duration", "0:00")
-    caption = (
+    return (
         f"🏆𝐁𝐲 𝐖𝐀𝐑𝐃𝐑𝐄𝐒𝐎𝐍𝐀𝐍𝐂𝐄𝐌𝐔𝐒𝐈𝐂🏆\n"
         f"🌙𝙉𝙤𝙢𝙚𝙧 𝙥𝙤𝙞𝙨𝙠𝙖:{number}№🌙\n"
         f"⭐️𝙬𝙖𝙧𝙙𝙢𝙪𝙨𝙞𝙘⭐️\n"
         f"☁️{duration}☁️"
     )
-    return caption
 
 
 # ─── Постинг ──────────────────────────────────────────────────────────────────
@@ -228,7 +247,6 @@ async def post_track(bot: Bot, track: dict, number: int) -> bool:
     caption = format_caption(track, number)
 
     if not audio_path or not Path(audio_path).exists():
-        log.error("Аудиофайл не найден: %s", audio_path)
         return False
 
     try:
@@ -259,14 +277,11 @@ async def post_batch(bot: Bot):
     queue = expand_queue()
 
     if not queue:
-        log.info("Очередь пуста, нечего постить.")
+        log.info("Очередь пуста.")
         return
 
     available = len(queue)
-    batch_min = min(BATCH_MIN, available)
-    batch_max = min(BATCH_MAX, available)
-    batch_size = random.randint(batch_min, batch_max)
-
+    batch_size = random.randint(min(BATCH_MIN, available), min(BATCH_MAX, available))
     log.info("Постим %d треков (доступно: %d)...", batch_size, available)
 
     posted = load_posted()
@@ -274,7 +289,6 @@ async def post_batch(bot: Bot):
     for i in range(batch_size):
         queue = load_queue()
         if not queue:
-            log.info("Очередь закончилась.")
             break
 
         url = queue.pop(0)
@@ -284,7 +298,6 @@ async def post_batch(bot: Bot):
         track = download_track(url)
 
         if not track:
-            log.error("Не удалось скачать, пропускаю: %s", url)
             continue
 
         number = get_counter()
