@@ -10,6 +10,7 @@ import json
 import random
 from pathlib import Path
 from datetime import datetime
+from aiohttp import web
 
 import yt_dlp
 from telegram import Bot
@@ -24,9 +25,10 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")
 
 POST_INTERVAL_HOURS = int(os.getenv("POST_INTERVAL_HOURS", "3"))
 
-# Сколько треков постить за раз
 BATCH_MIN = int(os.getenv("BATCH_MIN", "4"))
 BATCH_MAX = int(os.getenv("BATCH_MAX", "8"))
+
+PORT = int(os.getenv("PORT", "10000"))
 
 QUEUE_FILE = "queue.json"
 POSTED_FILE = "posted.json"
@@ -106,7 +108,7 @@ def expand_playlist(url: str) -> list:
         log.error("Ошибка разворачивания плейлиста: %s", e)
         return [url]
 
-def expand_queue():
+def expand_queue() -> list:
     queue = load_queue()
     new_queue = []
     changed = False
@@ -123,8 +125,9 @@ def expand_queue():
     if changed:
         save_queue(new_queue)
         log.info("Очередь обновлена: %d треков", len(new_queue))
+        return new_queue
 
-    return new_queue
+    return queue
 
 
 # ─── Скачивание ───────────────────────────────────────────────────────────────
@@ -241,17 +244,22 @@ async def post_batch(bot: Bot):
     queue = expand_queue()
 
     if not queue:
-        log.info("Очередь пуста.")
+        log.info("Очередь пуста, нечего постить.")
         return
 
-    batch_size = random.randint(BATCH_MIN, min(BATCH_MAX, len(queue)))
-    log.info("Постим %d треков...", batch_size)
+    available = len(queue)
+    batch_min = min(BATCH_MIN, available)
+    batch_max = min(BATCH_MAX, available)
+    batch_size = random.randint(batch_min, batch_max)
+
+    log.info("Постим %d треков (доступно: %d)...", batch_size, available)
 
     posted = load_posted()
 
     for i in range(batch_size):
         queue = load_queue()
         if not queue:
+            log.info("Очередь закончилась.")
             break
 
         url = queue.pop(0)
@@ -261,6 +269,7 @@ async def post_batch(bot: Bot):
         track = download_track(url)
 
         if not track:
+            log.error("Не удалось скачать, пропускаю: %s", url)
             continue
 
         number = get_counter()
@@ -286,6 +295,26 @@ async def post_batch(bot: Bot):
         await asyncio.sleep(3)
 
 
+# ─── Заглушка веб-сервера (нужна для Render Web Service) ─────────────────────
+
+async def handle(request):
+    queue = load_queue()
+    posted = load_posted()
+    return web.Response(
+        text=f"✅ Бот работает!\nТреков в очереди: {len(queue)}\nЗапостено всего: {len(posted)}",
+        content_type="text/plain"
+    )
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Веб-сервер запущен на порту %d", PORT)
+
+
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def main():
@@ -293,8 +322,13 @@ async def main():
     me = await bot.get_me()
     log.info("Бот запущен: @%s", me.username)
 
+    # Запускаем веб-сервер (для Render)
+    await start_web_server()
+
+    # Разворачиваем плейлисты при старте
     log.info("Разворачиваю плейлисты...")
-    expand_queue()
+    queue = expand_queue()
+    log.info("Треков в очереди: %d", len(queue))
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
