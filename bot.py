@@ -33,6 +33,7 @@ PORT = int(os.getenv("PORT", "10000"))
 QUEUE_FILE = "queue.json"
 POSTED_FILE = "posted.json"
 COUNTER_FILE = "counter.json"
+COOKIES_FILE = "cookies.txt"
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -88,10 +89,26 @@ def save_posted(posted: list):
         json.dump(posted, f, ensure_ascii=False, indent=2)
 
 
+# ─── YDL опции с куками ───────────────────────────────────────────────────────
+
+def get_ydl_opts(extra: dict = {}) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if Path(COOKIES_FILE).exists():
+        opts["cookiefile"] = COOKIES_FILE
+        log.info("Используем cookies.txt")
+    else:
+        log.warning("cookies.txt не найден!")
+    opts.update(extra)
+    return opts
+
+
 # ─── Разворачивание плейлиста ─────────────────────────────────────────────────
 
 def expand_playlist(url: str) -> list:
-    ydl_opts = {"quiet": True, "extract_flat": True, "no_warnings": True}
+    ydl_opts = get_ydl_opts({"extract_flat": True})
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -133,7 +150,7 @@ def expand_queue() -> list:
 # ─── Скачивание ───────────────────────────────────────────────────────────────
 
 def download_track(url: str) -> dict | None:
-    ydl_opts = {
+    ydl_opts = get_ydl_opts({
         "format": "bestaudio/best",
         "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
         "postprocessors": [
@@ -146,9 +163,7 @@ def download_track(url: str) -> dict | None:
             {"key": "EmbedThumbnail"},
         ],
         "writethumbnail": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -295,7 +310,7 @@ async def post_batch(bot: Bot):
         await asyncio.sleep(3)
 
 
-# ─── Заглушка веб-сервера (нужна для Render Web Service) ─────────────────────
+# ─── Веб-сервер ───────────────────────────────────────────────────────────────
 
 async def handle(request):
     queue = load_queue()
@@ -322,10 +337,8 @@ async def main():
     me = await bot.get_me()
     log.info("Бот запущен: @%s", me.username)
 
-    # Запускаем веб-сервер (для Render)
     await start_web_server()
 
-    # Разворачиваем плейлисты при старте
     log.info("Разворачиваю плейлисты...")
     queue = expand_queue()
     log.info("Треков в очереди: %d", len(queue))
